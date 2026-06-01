@@ -1,0 +1,12 @@
+openai
+yfinance
+pandas
+numpy
+arize-phoenix
+arize-phoenix-client
+arize-phoenix-evals
+openinference-instrumentation-openai
+pydantic
+python-dotenv
+jupyter
+matplotlib

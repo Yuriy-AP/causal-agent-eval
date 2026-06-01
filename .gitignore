@@ -1,0 +1,31 @@
+# Secrets — never commit API keys
+.env
+.env.*
+!.env.example
+reference/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Experiment outputs (optional local artifacts)
+experiments/*.csv
+!experiments/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+causalaieval/
+.env
