@@ -46,7 +46,7 @@ PROMPT_VERSIONS: dict[str, str] = {
 }
 
 
-def setup_tracing(*, verbose: bool = False) -> None:
+def setup_tracing(*, verbose: bool = False, endpoint: str | None = None) -> None:
     """
     Enable Phoenix tracing for OpenAI calls and manual tool/agent spans.
 
@@ -58,7 +58,11 @@ def setup_tracing(*, verbose: bool = False) -> None:
     if _tracing_enabled:
         return
 
-    _tracer_provider = register(project_name=PROJECT_NAME, verbose=verbose)
+    register_kwargs: dict[str, Any] = {"project_name": PROJECT_NAME, "verbose": verbose}
+    if endpoint:
+        register_kwargs["endpoint"] = endpoint
+
+    _tracer_provider = register(**register_kwargs)
     OpenAIInstrumentor().instrument(tracer_provider=_tracer_provider)
     _tracer = _tracer_provider.get_tracer(__name__)
 
@@ -109,17 +113,63 @@ def _get_stock_data_impl(
     return result
 
 
+def _extract_close_series(prices: Any) -> pd.Series:
+    """
+    Normalize price data to a float Series.
+
+    Handles tool output ({date, close} dicts) and common LLM-simplified formats
+    (plain float lists, or {closes: [...]}).
+    """
+    if prices is None:
+        return pd.Series(dtype=float)
+
+    if isinstance(prices, pd.Series):
+        return prices.astype(float)
+
+    if isinstance(prices, dict):
+        if "close" in prices:
+            close_val = prices["close"]
+            if isinstance(close_val, list):
+                return pd.Series([float(x) for x in close_val], dtype=float)
+            if isinstance(close_val, (int, float)):
+                return pd.Series([float(close_val)], dtype=float)
+        if "closes" in prices and isinstance(prices["closes"], list):
+            return pd.Series([float(x) for x in prices["closes"]], dtype=float)
+        values = list(prices.values())
+        if values and all(isinstance(v, (int, float)) for v in values):
+            return pd.Series([float(v) for v in values], dtype=float)
+        if values and all(isinstance(v, dict) for v in values):
+            return _extract_close_series(values)
+
+    if isinstance(prices, list):
+        if not prices:
+            return pd.Series(dtype=float)
+        first = prices[0]
+        if isinstance(first, dict):
+            closes: list[float] = []
+            for item in prices:
+                if isinstance(item, dict) and "close" in item:
+                    closes.append(float(item["close"]))
+                elif isinstance(item, (int, float)):
+                    closes.append(float(item))
+            return pd.Series(closes, dtype=float)
+        if isinstance(first, (int, float)):
+            return pd.Series([float(x) for x in prices], dtype=float)
+
+    return pd.Series(dtype=float)
+
+
 def _calculate_metrics_impl(
-    data: dict[str, list[dict[str, Any]]],
+    data: dict[str, Any],
 ) -> dict[str, dict[str, float | str]]:
     """Compute cumulative return, annualized return, annualized std dev, and Sharpe ratio."""
     metrics: dict[str, dict[str, float | str]] = {}
     for ticker, prices in data.items():
-        if not prices or len(prices) < 2:
+        closes = _extract_close_series(prices)
+        if len(closes) < 2:
             metrics[ticker] = {"error": "insufficient data"}
             continue
 
-        closes = pd.Series([p["close"] for p in prices])
         daily_returns = closes.pct_change().dropna()
         cumulative_return = float((closes.iloc[-1] / closes.iloc[0]) - 1)
         trading_days = len(daily_returns)
@@ -235,18 +285,22 @@ def _handle_tool_calls( # function is a private helper
     metrics: dict[str, dict[str, float | str]] | None = None
     summary = ""
 
-    tool_dispatch = {
-        "get_stock_data": lambda args: get_stock_data(**args),
-        "calculate_metrics": lambda args: calculate_metrics(**args),
-        "generate_summary": lambda args: generate_summary_tool(**args),
-    }
-
     for tool_call in tool_calls:
         name = tool_call.function.name
         args = json.loads(tool_call.function.arguments)
         tool_calls_made.append(name)
 
-        result = tool_dispatch[name](args)
+        if name == "get_stock_data":
+            result = get_stock_data(**args)
+            _run_context["stock_data"] = result
+        elif name == "calculate_metrics":
+            # Use cached fetch output — the LLM often passes truncated/simplified data
+            data = _run_context.get("stock_data") or args.get("data", {})
+            result = calculate_metrics(data)
+        elif name == "generate_summary":
+            result = generate_summary_tool(**args)
+        else:
+            raise ValueError(f"Unknown tool: {name}")
         if name == "calculate_metrics":
             metrics = result
         elif name == "generate_summary":
@@ -290,6 +344,7 @@ def run_agent(
             "client": client,
             "model": model,
             "temperature": temperature,
+            "stock_data": None,
         }
     )
 

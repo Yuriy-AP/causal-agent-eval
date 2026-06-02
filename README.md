@@ -1,6 +1,7 @@
 # CausalAgentBench
 
-Portfolio project: a financial analyst AI agent with structured evaluation using Phoenix tracing and LLM-as-judge scoring.
+This project explores applying causal inference to evaluate AI agent performance — using Phoenix tracing, LLM-as-judge scoring, and code-based evaluation. A financial analyst agent serves as the example, but the framework generalizes to any agent type.
+See `notebooks/01_agent_evaluation_demo.ipynb` for a working end-to-end demo.
 
 ## Motivation
 

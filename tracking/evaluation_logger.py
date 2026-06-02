@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 import pandas as pd
 from openinference.instrumentation import suppress_tracing
+from openinference.semconv.trace import SpanAttributes
 from phoenix.client.types.spans import SpanQuery
 from phoenix.evals import LLM, create_classifier
 
@@ -28,7 +30,23 @@ The summary must not invent numbers, misstate metrics, or claim relationships un
 
 ## Agent summary
 {summary}
+
+Classify with exactly one label: grounded or not_grounded.
 """
+
+
+def _normalize_groundedness_label(label: str) -> str:
+    """Map judge output to valid rails when the model returns prose instead of a label."""
+    normalized = label.strip().lower()
+    if normalized in {"grounded", "not_grounded"}:
+        return normalized
+    if "not_grounded" in normalized or normalized.startswith("not "):
+        return "not_grounded"
+    if any(token in normalized for token in ("unsupported", "incorrect", "invented", "misstate")):
+        return "not_grounded"
+    if "grounded" in normalized or "align" in normalized:
+        return "grounded"
+    return "not_grounded"
 
 
 def _build_groundedness_evaluator(judge_model: str):
@@ -38,8 +56,8 @@ def _build_groundedness_evaluator(judge_model: str):
         prompt_template=GROUNDEDNESS_TEMPLATE,
         llm=llm,
         choices={
-            "grounded": (1.0, "Summary aligns with the metrics"),
-            "not_grounded": (0.0, "Summary contains unsupported or incorrect claims"),
+            "grounded": 1.0,
+            "not_grounded": 0.0,
         },
         direction="maximize",
     )
@@ -64,34 +82,95 @@ def score_summary_groundedness(
 
     with suppress_tracing():
         evaluator = _build_groundedness_evaluator(judge_model)
-        scores = evaluator.evaluate(
-            {
-                "summary": summary,
-                "metrics": json.dumps(metrics, indent=2),
-            }
-        )
+        try:
+            scores = evaluator.evaluate(
+                {
+                    "summary": summary,
+                    "metrics": json.dumps(metrics, indent=2),
+                }
+            )
+            result = scores[0]
+            label = _normalize_groundedness_label(result.label or "")
+            score = float(
+                result.score
+                if result.score is not None
+                else (1.0 if label == "grounded" else 0.0)
+            )
+            return score, result.explanation or ""
+        except ValueError as exc:
+            if "invalid label" not in str(exc):
+                raise
+            match = re.search(r"invalid label '([^']+)'", str(exc))
+            raw_label = match.group(1) if match else ""
+            label = _normalize_groundedness_label(raw_label)
+            score = 1.0 if label == "grounded" else 0.0
+            return score, raw_label
 
-    result = scores[0]
-    score = float(
-        result.score if result.score is not None else (1.0 if result.label == "grounded" else 0.0)
-    )
-    return score, result.explanation or ""
+
+def _parse_summary_output(value: Any) -> str | None:
+    """Normalize tool span output to plain summary text."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and parsed.get("summary"):
+                return str(parsed["summary"])
+        except json.JSONDecodeError:
+            pass
+        return text
+    return str(value)
+
+
+def _ensure_span_id_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Phoenix span query results to include a span_id column."""
+    if df.empty:
+        return df
+
+    out = df.copy()
+    if "span_id" in out.columns:
+        return out
+
+    if out.index.name in {"span_id", "context.span_id"}:
+        out = out.reset_index()
+
+    if "context.span_id" in out.columns and "span_id" not in out.columns:
+        out["span_id"] = out["context.span_id"]
+
+    return out
 
 
 def fetch_generate_summary_spans(px_client: Any, *, project_name: str = PROJECT_NAME) -> pd.DataFrame:
     """Pull generate_summary tool spans from Phoenix using SpanQuery."""
     query = (
         SpanQuery()
-        .where("name == 'generate_summary'")
-        .select(
-            span_id="context.span_id",
-            summary="output.value",
-        )
+        .select("span_id", "name", "span_kind", SpanAttributes.OUTPUT_VALUE)
+        .rename(**{SpanAttributes.OUTPUT_VALUE: "summary"})
     )
-    spans_df = px_client.spans.get_spans_dataframe(query=query, project_name=project_name)
+
+    spans_df = pd.DataFrame()
+    for project in (project_name, None):
+        kwargs: dict[str, Any] = {"query": query, "limit": 5000}
+        if project:
+            kwargs["project_name"] = project
+        candidate = px_client.spans.get_spans_dataframe(**kwargs)
+        if not candidate.empty:
+            spans_df = candidate
+            break
+
     if spans_df.empty:
         return spans_df
-    return spans_df.dropna(subset=["summary"]).copy()
+
+    if "name" in spans_df.columns:
+        spans_df = spans_df[spans_df["name"] == "generate_summary"]
+
+    spans_df = spans_df.copy()
+    spans_df["summary"] = spans_df["summary"].apply(_parse_summary_output)
+    spans_df = spans_df.dropna(subset=["summary"]).copy()
+    return _ensure_span_id_column(spans_df)
 
 
 def log_groundedness_annotations_to_phoenix(
@@ -108,12 +187,21 @@ def log_groundedness_annotations_to_phoenix(
     """
     spans_df = fetch_generate_summary_spans(px_client, project_name=project_name)
     if spans_df.empty:
+        print(
+            "No generate_summary spans found. Run the experiment cell in the same kernel session "
+            "as launch_app()/setup_tracing(), then re-run this cell. CSV run logs still work for section 5."
+        )
         return spans_df
 
     runs_for_join = runs_df[["summary", "metrics", "llm_judge_score", "judge_explanation"]].copy()
     runs_for_join = runs_for_join.drop_duplicates(subset=["summary"])
 
     merged = spans_df.merge(runs_for_join, on="summary", how="left")
+    merged = _ensure_span_id_column(merged)
+
+    if "span_id" not in merged.columns:
+        print("Spans found but span_id column missing; skipping Phoenix annotations.")
+        return pd.DataFrame()
 
     for idx, row in merged.iterrows():
         if pd.notna(row.get("llm_judge_score")):
